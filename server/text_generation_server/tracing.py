@@ -54,6 +54,47 @@ class UDSOpenTelemetryAioServerInterceptor(OpenTelemetryAioServerInterceptor):
         )
 
 
+class TCPOpenTelemetryAioServerInterceptor(OpenTelemetryAioServerInterceptor):
+    def __init__(self):
+        super().__init__(trace.get_tracer(__name__))
+
+    def _start_span(self, handler_call_details, context, set_status_on_exception=False):
+        """
+        Rewrite _start_span method to support Transmission Control Protocol gRPC contexts
+        """
+
+        # standard attributes
+        attributes = {
+            SpanAttributes.RPC_SYSTEM: "grpc",
+            SpanAttributes.RPC_GRPC_STATUS_CODE: grpc.StatusCode.OK.value[0],
+        }
+
+        # if we have details about the call, split into service and method
+        if handler_call_details.method:
+            service, method = handler_call_details.method.lstrip("/").split("/", 1)
+            attributes.update(
+                {
+                    SpanAttributes.RPC_METHOD: method,
+                    SpanAttributes.RPC_SERVICE: service,
+                }
+            )
+
+        # add some attributes from the metadata
+        metadata = dict(context.invocation_metadata())
+        if "user-agent" in metadata:
+            attributes["rpc.user_agent"] = metadata["user-agent"]
+
+        # We use gRPC over a TCP socket
+        attributes.update({SpanAttributes.NET_TRANSPORT: "tcp"})
+
+        return self._tracer.start_as_current_span(
+            name=handler_call_details.method,
+            kind=trace.SpanKind.SERVER,
+            attributes=attributes,
+            set_status_on_exception=set_status_on_exception,
+        )
+
+
 def setup_tracing(shard: int, otlp_endpoint: str):
     resource = Resource.create(
         attributes={"service.name": f"text-generation-inference.server-{shard}"}

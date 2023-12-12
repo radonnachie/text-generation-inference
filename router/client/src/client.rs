@@ -24,35 +24,44 @@ impl Client {
         })
     }
 
-    /// Returns a client connected to the given unix socket
-    pub async fn connect_uds(path: String) -> Result<Self> {
-        let channel = Channel::from_shared("http://[::]:50051".to_string())
-            .unwrap()
-            .connect_with_connector(tower::service_fn(move |_: Uri| {
-                tokio::net::UnixStream::connect(path.clone())
-            }))
-            .await?;
+    /// Returns a client connected to shard via the given uri
+    pub async fn connect_shard(uri_string: String) -> Result<Self> {
+        let uri = uri_string.parse::<Uri>().unwrap();
+        // the endpoint created uses a bogus url initially
+        let endpoint = Channel::from_shared("http://[::]:50051").unwrap();
+
+        let channel = match uri.scheme_str() {
+            Some("tcp") => endpoint.connect_with_connector(tower::service_fn(move |_: Uri| {
+                tokio::net::TcpStream::connect(
+                    uri.authority().unwrap().to_string()
+                )
+            })).await,
+            Some("unix") => endpoint.connect_with_connector(tower::service_fn(move |_: Uri| {
+                let uds_path = format!("/{}{}", uri.host().unwrap(), uri.path());
+                tokio::net::UnixStream::connect(
+                    uds_path
+                )
+            })).await,
+            _ => endpoint.connect_with_connector(tower::service_fn(move |_: Uri| {
+                tokio::net::UnixStream::connect(
+                    uri.to_string()
+                )
+            })).await
+        }?;
 
         Ok(Self {
             stub: TextGenerationServiceClient::new(channel),
         })
     }
 
-    /// Returns a list of uris or unix sockets of all shards
+    /// Returns a list of URI strings of all shards
     #[instrument(skip(self))]
     pub async fn service_discovery(&mut self) -> Result<Vec<String>> {
         let request = tonic::Request::new(ServiceDiscoveryRequest {}).inject_context();
         let response = self.stub.service_discovery(request).await?;
         let urls = response
             .into_inner()
-            .urls
-            .into_iter()
-            // Remove unix socket prefix
-            .map(|url| match url.strip_prefix("unix://") {
-                None => url,
-                Some(stripped_url) => stripped_url.to_string(),
-            })
-            .collect();
+            .urls;
         Ok(urls)
     }
 

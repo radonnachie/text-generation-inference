@@ -35,7 +35,7 @@ def serve(
     speculate: Optional[int] = None,
     dtype: Optional[Dtype] = None,
     trust_remote_code: bool = False,
-    uds_path: Path = "/tmp/text-generation-server",
+    shard_uri_prefix: str = "unix://tmp/text-generation-server",
     logger_level: str = "INFO",
     json_output: bool = False,
     otlp_endpoint: Optional[str] = None,
@@ -94,7 +94,7 @@ def serve(
         speculate,
         dtype,
         trust_remote_code,
-        uds_path,
+        shard_uri_prefix,
     )
 
 

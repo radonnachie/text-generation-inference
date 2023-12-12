@@ -281,8 +281,8 @@ def launcher(event_loop):
         port = random.randint(8000, 10_000)
         master_port = random.randint(10_000, 20_000)
 
-        shard_uds_path = (
-            f"/tmp/tgi-tests-{model_id.split('/')[-1]}-{num_shard}-{quantize}-server"
+        shard_uri = (
+            f"unix://tmp/tgi-tests-{model_id.split('/')[-1]}-{num_shard}-{quantize}-server"
         )
 
         args = [
@@ -293,8 +293,8 @@ def launcher(event_loop):
             str(port),
             "--master-port",
             str(master_port),
-            "--shard-uds-path",
-            shard_uds_path,
+            "--shard-uri",
+            shard_uri,
         ]
 
         env = os.environ

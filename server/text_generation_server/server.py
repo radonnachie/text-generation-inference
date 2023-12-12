@@ -1,5 +1,6 @@
 import asyncio
 import os
+import re
 import torch
 import time
 
@@ -14,7 +15,7 @@ from text_generation_server.cache import Cache
 from text_generation_server.interceptor import ExceptionInterceptor
 from text_generation_server.models import Model, get_model
 from text_generation_server.pb import generate_pb2_grpc, generate_pb2
-from text_generation_server.tracing import UDSOpenTelemetryAioServerInterceptor
+from text_generation_server.tracing import UDSOpenTelemetryAioServerInterceptor, TCPOpenTelemetryAioServerInterceptor
 from text_generation_server.models.idefics_causal_lm import IdeficsCausalLMBatch
 
 
@@ -162,6 +163,13 @@ class TextGenerationService(generate_pb2_grpc.TextGenerationServiceServicer):
         )
 
 
+def _format_shard_uri(prefix:str, rank:int):
+    m = re.match(r"tcp://([^:]*):(\d+)", prefix)
+    if m is not None:
+        return f"tcp://{m.group(1)}:{int(m.group(2))+rank}"
+    return f"{prefix}-{rank}"
+
+
 def serve(
     model_id: str,
     revision: Optional[str],
@@ -170,7 +178,7 @@ def serve(
     speculate: Optional[int],
     dtype: Optional[str],
     trust_remote_code: bool,
-    uds_path: Path,
+    shard_uri_prefix: str,
 ):
     async def serve_inner(
         model_id: str,
@@ -181,16 +189,15 @@ def serve(
         dtype: Optional[str] = None,
         trust_remote_code: bool = False,
     ):
-        unix_socket_template = "unix://{}-{}"
         if sharded:
-            server_urls = [
-                unix_socket_template.format(uds_path, rank)
+            server_uris = [
+                _format_shard_uri(shard_uri_prefix, rank)
                 for rank in range(int(os.environ["WORLD_SIZE"]))
             ]
-            local_url = server_urls[int(os.environ["RANK"])]
+            local_uri = server_uris[int(os.environ["RANK"])]
         else:
-            local_url = unix_socket_template.format(uds_path, 0)
-            server_urls = [local_url]
+            local_uri = _format_shard_uri(shard_uri_prefix, 0)
+            server_uris = [local_uri]
 
         try:
             model = get_model(
@@ -209,22 +216,28 @@ def serve(
         server = aio.server(
             interceptors=[
                 ExceptionInterceptor(),
-                UDSOpenTelemetryAioServerInterceptor(),
+                TCPOpenTelemetryAioServerInterceptor()
+                if shard_uri_prefix.startswith("tcp://")
+                else UDSOpenTelemetryAioServerInterceptor()
             ]
         )
         generate_pb2_grpc.add_TextGenerationServiceServicer_to_server(
-            TextGenerationService(model, Cache(), quantize, server_urls), server
+            TextGenerationService(model, Cache(), quantize, server_uris), server
         )
         SERVICE_NAMES = (
             generate_pb2.DESCRIPTOR.services_by_name["TextGenerationService"].full_name,
             reflection.SERVICE_NAME,
         )
         reflection.enable_server_reflection(SERVICE_NAMES, server)
-        server.add_insecure_port(local_url)
+        server.add_insecure_port(
+            local_uri[len("tcp://"):]
+            if local_uri.startswith("tcp://")
+            else local_uri
+        )
 
         await server.start()
 
-        logger.info("Server started at {}".format(local_url))
+        logger.info("Server started at {}".format(local_uri))
 
         try:
             await server.wait_for_termination()

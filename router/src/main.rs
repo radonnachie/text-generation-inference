@@ -52,7 +52,7 @@ struct Args {
     #[clap(default_value = "3000", long, short, env)]
     port: u16,
     #[clap(default_value = "/tmp/text-generation-server-0", long, env)]
-    master_shard_uds_path: String,
+    master_shard_uri: String,
     #[clap(default_value = "bigscience/bloom", long, env)]
     tokenizer_name: String,
     #[clap(long, env)]
@@ -98,7 +98,7 @@ async fn main() -> Result<(), RouterError> {
         max_batch_size,
         hostname,
         port,
-        master_shard_uds_path,
+        master_shard_uri,
         tokenizer_name,
         tokenizer_config_path,
         revision,

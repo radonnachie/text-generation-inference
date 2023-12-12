@@ -57,7 +57,7 @@ struct Args {
     /// The location of the grpc socket. This benchmark tool bypasses the router
     /// completely and directly talks to the gRPC processes
     #[clap(default_value = "/tmp/text-generation-server-0", short, long, env)]
-    master_shard_uds_path: String,
+    master_shard_uri: String,
 
     /// Generation parameter in case you want to specifically test/debug particular
     /// decoding strategies, for full doc refer to the `text-generation-server`
@@ -127,7 +127,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         frequency_penalty,
         watermark,
         do_sample,
-        master_shard_uds_path,
+        master_shard_uri,
         top_n_tokens,
     } = args;
 
@@ -168,7 +168,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .block_on(async {
             // Instantiate sharded client from the master unix socket
             tracing::info!("Connect to model server");
-            let mut sharded_client = ShardedClient::connect_uds(master_shard_uds_path)
+            let mut sharded_client = ShardedClient::connect_shard(master_shard_uri)
                 .await
                 .expect("Could not connect to server");
             // Clear the cache; useful if the webserver rebooted

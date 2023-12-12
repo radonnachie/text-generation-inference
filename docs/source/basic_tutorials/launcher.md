@@ -233,13 +233,13 @@ Options:
           [default: 3000]
 
 ```
-## SHARD_UDS_PATH
+## SHARD_URI
 ```shell
-      --shard-uds-path <SHARD_UDS_PATH>
-          The name of the socket for gRPC communication between the webserver and the shards
+      --shard-uri <SHARD_URI>
+          The path of the socket for gRPC communication between the webserver and the shards
           
-          [env: SHARD_UDS_PATH=]
-          [default: /tmp/text-generation-server]
+          [env: SHARD_URI=]
+          [default: unix://tmp/text-generation-server]
 
 ```
 ## MASTER_ADDR

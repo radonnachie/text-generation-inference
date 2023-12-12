@@ -16,6 +16,8 @@ use std::thread::sleep;
 use std::time::{Duration, Instant};
 use std::{fs, io};
 use tracing_subscriber::EnvFilter;
+use http::Uri;
+use std::net::TcpStream;
 
 mod env_runtime;
 
@@ -304,8 +306,8 @@ struct Args {
 
     /// The name of the socket for gRPC communication between the webserver
     /// and the shards.
-    #[clap(default_value = "/tmp/text-generation-server", long, env)]
-    shard_uds_path: String,
+    #[clap(default_value = "unix://tmp/text-generation-server", long, env)]
+    shard_uri: String,
 
     /// The address the master shard will listen on. (setting used by torch distributed)
     #[clap(default_value = "localhost", long, env)]
@@ -412,7 +414,7 @@ fn shard_manager(
     speculate: Option<usize>,
     dtype: Option<Dtype>,
     trust_remote_code: bool,
-    uds_path: String,
+    shard_uri_prefix: String,
     rank: usize,
     world_size: usize,
     master_addr: String,
@@ -434,20 +436,36 @@ fn shard_manager(
     // Enter shard-manager tracing span
     let _span = tracing::span!(tracing::Level::INFO, "shard-manager", rank = rank).entered();
 
-    // Get UDS path
-    let uds_string = format!("{uds_path}-{rank}");
-    let uds = Path::new(&uds_string);
+    let shard_uri = shard_uri_prefix.parse::<Uri>().unwrap();
+    let shard_uri = match shard_uri.scheme_str() {
+        Some("tcp") => format!(
+            "tcp://{}:{}",
+            shard_uri.host().unwrap(),
+            shard_uri.port_u16().unwrap() + (rank as u16)
+        ).parse::<Uri>().unwrap(),
+        // TODO adjust the path for uds, move from shard_uri_prefix to master_shard_uri
+        _ => format!("{}-{rank}", shard_uri_prefix.to_string()).parse::<Uri>().unwrap(),
+    };
+    
     // Clean previous runs
-    if uds.exists() {
-        fs::remove_file(uds).unwrap();
+    match shard_uri.scheme_str() {
+        Some("unix") => {
+            // Get UDS path
+            let uds_path = format!("/{}{}", shard_uri.host().unwrap(), shard_uri.path());
+            let uds = Path::new(&uds_path);
+            if uds.exists() {
+                fs::remove_file(uds).unwrap();
+            }
+        }
+        _ => {},
     }
 
     // Process args
     let mut shard_args = vec![
         "serve".to_string(),
         model_id,
-        "--uds-path".to_string(),
-        uds_path,
+        "--shard-uri-prefix".to_string(),
+        shard_uri_prefix,
         "--logger-level".to_string(),
         "INFO".to_string(),
         "--json-output".to_string(),
@@ -505,6 +523,8 @@ fn shard_manager(
     envs.push(("MASTER_ADDR".into(), master_addr.into()));
     envs.push(("MASTER_PORT".into(), master_port.to_string().into()));
     envs.push(("TORCH_NCCL_AVOID_RECORD_STREAMS".into(), "1".into()));
+    envs.push(("NCCL_ASYNC_ERROR_HANDLING".into(), "1".into()));
+    envs.push(("GRPC_VERBOSITY=".into(), "debug".into()));
 
     // CUDA memory fraction
     envs.push((
@@ -652,13 +672,35 @@ fn shard_manager(
             return;
         }
 
+        
         // Shard is ready
-        if uds.exists() && !ready {
-            tracing::info!("Shard ready in {:?}", start_time.elapsed());
-            status_sender.send(ShardStatus::Ready).unwrap();
-            ready = true;
-        } else if !ready && wait_time.elapsed() > Duration::from_secs(10) {
-            tracing::info!("Waiting for shard to be ready...");
+        match shard_uri.scheme_str() {
+            Some("tcp") => {
+                if let Ok(_stream) = TcpStream::connect(shard_uri.authority().unwrap().to_string()) {
+                    if !ready {
+                        tracing::info!("Shard ready in {:?}", start_time.elapsed());
+                        status_sender.send(ShardStatus::Ready).unwrap();
+                        ready = true;
+                    }
+                }
+            },
+            Some("unix") => {
+                // Get UDS path
+                let uds_path = format!("/{}{}", shard_uri.host().unwrap(), shard_uri.path());
+                let uds = Path::new(&uds_path);
+                
+                if uds.exists() && !ready {
+                    tracing::info!("Shard ready in {:?}", start_time.elapsed());
+                    status_sender.send(ShardStatus::Ready).unwrap();
+                    ready = true;
+                }
+            },
+            _ => {
+                todo!();
+            }
+        }
+        if !ready && wait_time.elapsed() > Duration::from_secs(10) {
+            tracing::info!("Waiting for shard at {shard_uri} to be ready...");
             wait_time = Instant::now();
         }
         sleep(Duration::from_millis(100));
@@ -939,7 +981,7 @@ fn spawn_shards(
     for rank in 0..num_shard {
         let model_id = args.model_id.clone();
         let revision = args.revision.clone();
-        let uds_path = args.shard_uds_path.clone();
+        let shard_uri = args.shard_uri.clone();
         let master_addr = args.master_addr.clone();
         let huggingface_hub_cache = args.huggingface_hub_cache.clone();
         let weights_cache_override = args.weights_cache_override.clone();
@@ -971,7 +1013,7 @@ fn spawn_shards(
                 speculate,
                 dtype,
                 trust_remote_code,
-                uds_path,
+                shard_uri,
                 rank,
                 num_shard,
                 master_addr,
@@ -1042,6 +1084,13 @@ fn spawn_webserver(
 ) -> Result<Child, LauncherError> {
     // All shard started
     // Start webserver
+
+    let master_shard_uri = args.shard_uri.parse::<Uri>().unwrap();
+    let master_shard_uri = match master_shard_uri.scheme_str() {
+        Some("tcp") => args.shard_uri,
+        _ => format!("{}-0", args.shard_uri),
+    };
+
     tracing::info!("Starting Webserver");
     let mut router_args = vec![
         "--max-concurrent-requests".to_string(),
@@ -1068,8 +1117,8 @@ fn spawn_webserver(
         args.hostname.to_string(),
         "--port".to_string(),
         args.port.to_string(),
-        "--master-shard-uds-path".to_string(),
-        format!("{}-0", args.shard_uds_path),
+        "--master-shard-uri".to_string(),
+        master_shard_uri,
         "--tokenizer-name".to_string(),
         args.model_id,
     ];
