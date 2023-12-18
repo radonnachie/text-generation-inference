@@ -4,7 +4,7 @@ import re
 import torch
 import time
 
-from grpc import aio
+from grpc import aio, insecure_channel
 from loguru import logger
 
 from grpc_reflection.v1alpha import reflection
@@ -30,7 +30,7 @@ class TextGenerationService(generate_pb2_grpc.TextGenerationServiceServicer):
         self.cache = cache
         self.model = model
         self.quantize = quantize
-        self.server_urls = server_urls
+        self.server_urls = set(server_urls)
         # For some reason, inference_mode does not work well with GLOO which we use on CPU
         if model.device.type == "cuda":
             # Force inference mode for the lifetime of TextGenerationService
@@ -45,7 +45,12 @@ class TextGenerationService(generate_pb2_grpc.TextGenerationServiceServicer):
         return generate_pb2.HealthResponse()
 
     async def ServiceDiscovery(self, request, context):
-        return generate_pb2.ServiceDiscoveryResponse(urls=self.server_urls)
+        return generate_pb2.ServiceDiscoveryResponse(urls=list(self.server_urls))
+
+    async def ServiceRegistration(self, request, context):
+        other_server_urls = self.server_urls.difference(set(request.urls))
+        self.server_urls = self.server_urls.union(set(request.urls))
+        return generate_pb2.ServiceRegistrationResponse(urls=list(other_server_urls))
 
     async def ClearCache(self, request, context):
         if request.HasField("id"):
@@ -192,9 +197,9 @@ def serve(
         if sharded:
             server_uris = [
                 _format_shard_uri(shard_uri_prefix, rank)
-                for rank in range(int(os.environ["WORLD_SIZE"]))
+                for rank in range(int(os.environ["NUM_SHARD"]))
             ]
-            local_uri = server_uris[int(os.environ["RANK"])]
+            local_uri = server_uris[int(os.environ["RANK_LOCAL"])]
         else:
             local_uri = _format_shard_uri(shard_uri_prefix, 0)
             server_uris = [local_uri]
@@ -212,6 +217,31 @@ def serve(
         except Exception:
             logger.exception("Error when initializing model")
             raise
+
+        # Can only do this after the distributed model has connected to the master shard
+        if (int(os.getenv("RANK", "0")) > 0
+            and int(os.getenv("NUM_SHARD", "1")) < int(os.getenv("WORLD_SIZE", "1"))
+        ):
+            assert (
+                shard_uri_prefix.startswith("tcp://")
+            ), "Local shard URI must be TCP when NUM_SHARD < WORLD_SIZE"
+            assert (
+                os.getenv("MASTER_ADDR", None) is not None
+            ), "MASTER_ADDR must be set when NUM_SHARD < WORLD_SIZE"
+            assert (
+                os.getenv("MASTER_SERVICE_PORT", None) is not None
+            ), "MASTER_SERVICE_PORT must be set when NUM_SHARD < WORLD_SIZE"
+
+            # TODO assert that the local service_uris are resolved
+            channel_url = f"{os.environ['MASTER_ADDR']}:{os.environ['MASTER_SERVICE_PORT']}"
+            stub = generate_pb2_grpc.TextGenerationServiceStub(
+                insecure_channel(channel_url)
+            )
+            stub.ServiceRegistration(
+                generate_pb2.ServiceRegistrationRequest(
+                    urls=server_uris
+                )
+            )
 
         server = aio.server(
             interceptors=[

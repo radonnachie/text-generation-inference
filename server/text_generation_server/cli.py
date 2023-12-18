@@ -40,6 +40,12 @@ def serve(
     json_output: bool = False,
     otlp_endpoint: Optional[str] = None,
 ):
+    # Backwards compatibility
+    if (local_rank := os.getenv("RANK_LOCAL", None)) is not None:
+        os.environ["RANK"] = os.getenv("RANK", local_rank)
+    if (local_world_size := os.getenv("NUM_SHARD", None)) is not None:
+        os.environ["WORLD_SIZE"] = os.getenv("WORLD_SIZE", local_world_size)
+
     if sharded:
         assert (
             os.getenv("RANK", None) is not None

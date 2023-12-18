@@ -309,6 +309,10 @@ struct Args {
     #[clap(default_value = "unix://tmp/text-generation-server", long, env)]
     shard_uri: String,
 
+    /// Operate as a headless set of shards, i.e. disable python webserver interface
+    #[clap(long, env)]
+    headless: bool,
+
     /// The address the master shard will listen on. (setting used by torch distributed)
     #[clap(default_value = "localhost", long, env)]
     master_addr: String,
@@ -316,6 +320,19 @@ struct Args {
     /// The address the master port will listen on. (setting used by torch distributed)
     #[clap(default_value = "29500", long, env)]
     master_port: usize,
+
+    /// The port the world-master shard service will listen on, at the `master_addr`
+    /// address.
+    #[clap(long, env)]
+    world_master_service_port: Option<usize>,
+
+    /// The rank offset for these local shards, ranking them within the world.
+    #[clap(long, env)]
+    world_rank_offset: Option<usize>,
+
+    /// The number of shards in the world.  (setting used by torch distributed)
+    #[clap(long, env)]
+    world_num_shard: Option<usize>,
 
     /// The location of the huggingface hub cache.
     /// Used to override the location if you want to provide a mounted disk for instance
@@ -416,9 +433,12 @@ fn shard_manager(
     trust_remote_code: bool,
     shard_uri_prefix: String,
     rank: usize,
-    world_size: usize,
+    num_shard: usize,
     master_addr: String,
     master_port: usize,
+    world_master_service_port: Option<usize>,
+    world_rank_offset: Option<usize>,
+    world_num_shard: Option<usize>,
     huggingface_hub_cache: Option<String>,
     weights_cache_override: Option<String>,
     disable_custom_kernels: bool,
@@ -477,7 +497,7 @@ fn shard_manager(
     }
 
     // Activate tensor parallelism
-    if world_size > 1 {
+    if num_shard > 1 {
         shard_args.push("--sharded".to_string());
     }
 
@@ -517,14 +537,24 @@ fn shard_manager(
     // Copy current process env
     let mut envs: Vec<(OsString, OsString)> = env::vars_os().collect();
 
+    // Local Sharding Env vars
+    envs.push(("RANK_LOCAL".into(), rank.to_string().into()));
+    envs.push(("NUM_SHARD".into(), num_shard.to_string().into()));
+    if let Some(service_port) = world_master_service_port {
+        envs.push(("MASTER_SERVICE_PORT".into(), service_port.to_string().into()));
+    }
+
     // Torch Distributed Env vars
-    envs.push(("RANK".into(), rank.to_string().into()));
+    let world_size = world_num_shard.unwrap_or(num_shard);
+    let world_rank = world_rank_offset.unwrap_or(0);
+    envs.push(("RANK".into(), (world_rank + rank).to_string().into()));
     envs.push(("WORLD_SIZE".into(), world_size.to_string().into()));
     envs.push(("MASTER_ADDR".into(), master_addr.into()));
     envs.push(("MASTER_PORT".into(), master_port.to_string().into()));
     envs.push(("TORCH_NCCL_AVOID_RECORD_STREAMS".into(), "1".into()));
     envs.push(("NCCL_ASYNC_ERROR_HANDLING".into(), "1".into()));
-    envs.push(("GRPC_VERBOSITY=".into(), "debug".into()));
+    envs.push(("GRPC_VERBOSITY".into(), "debug".into()));
+    envs.push(("NCCL_DEBUG".into(), "INFO".into()));
 
     // CUDA memory fraction
     envs.push((
@@ -983,6 +1013,9 @@ fn spawn_shards(
         let revision = args.revision.clone();
         let shard_uri = args.shard_uri.clone();
         let master_addr = args.master_addr.clone();
+        let world_master_service_port = args.world_master_service_port.clone();
+        let world_rank_offset = args.world_rank_offset.clone();
+        let world_num_shard = args.world_num_shard.clone();
         let huggingface_hub_cache = args.huggingface_hub_cache.clone();
         let weights_cache_override = args.weights_cache_override.clone();
         let status_sender = status_sender.clone();
@@ -1018,6 +1051,9 @@ fn spawn_shards(
                 num_shard,
                 master_addr,
                 master_port,
+                world_master_service_port,
+                world_rank_offset,
+                world_num_shard,
                 huggingface_hub_cache,
                 weights_cache_override,
                 disable_custom_kernels,
@@ -1352,7 +1388,7 @@ fn main() -> Result<(), LauncherError> {
     .expect("Error setting Ctrl-C handler");
 
     // Download and convert model weights
-    download_convert_model(&args, running.clone())?;
+    // download_convert_model(&args, running.clone())?;
 
     if !running.load(Ordering::SeqCst) {
         // Launcher was asked to stop
@@ -1385,11 +1421,15 @@ fn main() -> Result<(), LauncherError> {
         return Ok(());
     }
 
-    let mut webserver = spawn_webserver(num_shard, args, shutdown.clone(), &shutdown_receiver)
-        .map_err(|err| {
-            shutdown_shards(shutdown.clone(), &shutdown_receiver);
-            err
-        })?;
+    let mut webserver = match args.headless {
+        false => Some(spawn_webserver(num_shard, args, shutdown.clone(), &shutdown_receiver)
+            .map_err(|err| {
+                shutdown_shards(shutdown.clone(), &shutdown_receiver);
+                err
+            })?
+        ),
+        true => None
+    };
 
     // Default exit code
     let mut exit_code = Ok(());
@@ -1401,20 +1441,24 @@ fn main() -> Result<(), LauncherError> {
             break;
         };
 
-        match webserver.try_wait().unwrap() {
-            Some(_) => {
-                tracing::error!("Webserver Crashed");
-                shutdown_shards(shutdown, &shutdown_receiver);
-                return Err(LauncherError::WebserverFailed);
-            }
-            None => {
-                sleep(Duration::from_millis(100));
-            }
-        };
+        if let Some(ref mut webserver) = webserver {
+            match webserver.try_wait().unwrap() {
+                Some(_) => {
+                    tracing::error!("Webserver Crashed");
+                    shutdown_shards(shutdown, &shutdown_receiver);
+                    return Err(LauncherError::WebserverFailed);
+                }
+                None => {
+                    sleep(Duration::from_millis(100));
+                }
+            };
+        }
     }
 
     // Graceful termination
-    terminate("webserver", webserver, Duration::from_secs(90)).unwrap();
+    if let Some(webserver) = webserver {
+        terminate("webserver", webserver, Duration::from_secs(90)).unwrap();
+    }
     shutdown_shards(shutdown, &shutdown_receiver);
 
     exit_code

@@ -48,7 +48,7 @@ def initialize_torch_distributed():
         from torch.distributed import ProcessGroupNCCL
 
         # Set the device id.
-        assert WORLD_SIZE <= torch.cuda.device_count(), "Each process is one gpu"
+        # assert WORLD_SIZE <= torch.cuda.device_count(), "Each process is one gpu"
         device = RANK % torch.cuda.device_count()
         torch.cuda.set_device(device)
         torch.cuda.set_per_process_memory_fraction(MEMORY_FRACTION, device)

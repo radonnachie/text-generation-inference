@@ -7,6 +7,8 @@ service TextGenerationService {
     rpc Info (InfoRequest) returns (InfoResponse) {}
     /// Service discovery
     rpc ServiceDiscovery (ServiceDiscoveryRequest) returns (ServiceDiscoveryResponse) {}
+    /// Service registration
+    rpc ServiceRegistration (ServiceRegistrationRequest) returns (ServiceRegistrationResponse) {}
     /// Empties batch cache
     rpc ClearCache (ClearCacheRequest) returns (ClearCacheResponse);
     /// Remove requests from a cached batch
@@ -39,6 +41,16 @@ message InfoResponse {
 message ServiceDiscoveryRequest {}
 
 message ServiceDiscoveryResponse {
+    /// Other shards urls
+    repeated string urls = 1;
+}
+
+message ServiceRegistrationRequest {
+    /// Local shards urls
+    repeated string urls = 1;
+}
+
+message ServiceRegistrationResponse {
     /// Other shards urls
     repeated string urls = 1;
 }
