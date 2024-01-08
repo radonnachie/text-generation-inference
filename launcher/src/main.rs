@@ -555,6 +555,9 @@ fn shard_manager(
     envs.push(("NCCL_ASYNC_ERROR_HANDLING".into(), "1".into()));
     envs.push(("GRPC_VERBOSITY".into(), "debug".into()));
     envs.push(("NCCL_DEBUG".into(), "INFO".into()));
+    envs.push(("RUST_BACKTRACE".into(), "1".into()));
+    envs.push(("TORCH_CPP_LOG_LEVEL".into(), "INFO".into()));
+    envs.push(("TORCH_DISTRIBUTED_DEBUG".into(), "DETAIL".into()));
 
     // CUDA memory fraction
     envs.push((
@@ -702,36 +705,37 @@ fn shard_manager(
             return;
         }
 
-        
         // Shard is ready
-        match shard_uri.scheme_str() {
-            Some("tcp") => {
-                if let Ok(_stream) = TcpStream::connect(shard_uri.authority().unwrap().to_string()) {
-                    if !ready {
+        if !ready {
+            match shard_uri.scheme_str() {
+                Some("tcp") => {
+                    if let Ok(_stream) = TcpStream::connect(shard_uri.authority().unwrap().to_string()) {
+                        if !ready {
+                            tracing::info!("Shard ready in {:?}", start_time.elapsed());
+                            status_sender.send(ShardStatus::Ready).unwrap();
+                            ready = true;
+                        }
+                    }
+                },
+                Some("unix") => {
+                    // Get UDS path
+                    let uds_path = format!("/{}{}", shard_uri.host().unwrap(), shard_uri.path());
+                    let uds = Path::new(&uds_path);
+                    
+                    if uds.exists() && !ready {
                         tracing::info!("Shard ready in {:?}", start_time.elapsed());
                         status_sender.send(ShardStatus::Ready).unwrap();
                         ready = true;
                     }
+                },
+                _ => {
+                    todo!();
                 }
-            },
-            Some("unix") => {
-                // Get UDS path
-                let uds_path = format!("/{}{}", shard_uri.host().unwrap(), shard_uri.path());
-                let uds = Path::new(&uds_path);
-                
-                if uds.exists() && !ready {
-                    tracing::info!("Shard ready in {:?}", start_time.elapsed());
-                    status_sender.send(ShardStatus::Ready).unwrap();
-                    ready = true;
-                }
-            },
-            _ => {
-                todo!();
             }
-        }
-        if !ready && wait_time.elapsed() > Duration::from_secs(10) {
-            tracing::info!("Waiting for shard at {shard_uri} to be ready...");
-            wait_time = Instant::now();
+            if !ready && wait_time.elapsed() > Duration::from_secs(10) {
+                tracing::info!("Waiting for shard at {shard_uri} to be ready...");
+                wait_time = Instant::now();
+            }
         }
         sleep(Duration::from_millis(100));
     }
@@ -1388,7 +1392,7 @@ fn main() -> Result<(), LauncherError> {
     .expect("Error setting Ctrl-C handler");
 
     // Download and convert model weights
-    // download_convert_model(&args, running.clone())?;
+    download_convert_model(&args, running.clone())?;
 
     if !running.load(Ordering::SeqCst) {
         // Launcher was asked to stop

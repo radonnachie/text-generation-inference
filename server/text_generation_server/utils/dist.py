@@ -69,6 +69,7 @@ def initialize_torch_distributed():
         if not torch.distributed.is_initialized():
             # Call the init process.
             torch.distributed.init_process_group(
+                init_method=os.getenv("INIT_METHOD", None),
                 backend=backend,
                 world_size=WORLD_SIZE,
                 rank=RANK,

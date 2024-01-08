@@ -19,7 +19,7 @@ impl ShardedClient {
 
     /// Create a new ShardedClient from a master client. The master client will communicate with
     /// the other shards and returns all uris/unix sockets with the `service_discovery` gRPC method.
-    async fn from_master_client(mut master_client: Client) -> Result<Self> {
+    pub async fn from_master_client(mut master_client: Client) -> Result<Self> {
         // Get all shard uris from the master client
         let uris = master_client.service_discovery().await?;
         let futures = uris.into_iter().map(Client::connect_shard);

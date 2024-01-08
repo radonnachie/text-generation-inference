@@ -26,11 +26,13 @@ class TextGenerationService(generate_pb2_grpc.TextGenerationServiceServicer):
         cache: Cache,
         quantize: Optional[str],
         server_urls: List[str],
+        world_size: int
     ):
         self.cache = cache
         self.model = model
         self.quantize = quantize
         self.server_urls = set(server_urls)
+        self.world_size = world_size
         # For some reason, inference_mode does not work well with GLOO which we use on CPU
         if model.device.type == "cuda":
             # Force inference mode for the lifetime of TextGenerationService
@@ -42,7 +44,11 @@ class TextGenerationService(generate_pb2_grpc.TextGenerationServiceServicer):
     async def Health(self, request, context):
         if self.model.device.type == "cuda":
             torch.zeros((2, 2)).cuda()
-        return generate_pb2.HealthResponse()
+        return generate_pb2.HealthResponse(
+            world_size=self.world_size,
+            registered_shards=len(self.server_urls),
+            all_shards_registered=(self.world_size == len(self.server_urls))
+        )
 
     async def ServiceDiscovery(self, request, context):
         return generate_pb2.ServiceDiscoveryResponse(urls=list(self.server_urls))
@@ -62,8 +68,9 @@ class TextGenerationService(generate_pb2_grpc.TextGenerationServiceServicer):
     async def FilterBatch(self, request, context):
         batch = self.cache.pop(request.batch_id)
         if batch is None:
-            raise ValueError(f"Batch ID {request.batch_id} not found in cache.")
+            raise ValueError(f"Batch ID {request.batch_id if request is not None else None} not found in cache.")
         filtered_batch = batch.filter(request.request_ids)
+        logger.info(f"FilterBatch cache.set({filtered_batch.batch_id if filtered_batch is not None else None})")
         self.cache.set(filtered_batch)
 
         return generate_pb2.FilterBatchResponse(batch=filtered_batch.to_pb())
@@ -122,6 +129,7 @@ class TextGenerationService(generate_pb2_grpc.TextGenerationServiceServicer):
             )
 
         generations, next_batch, timings = self.model.generate_token(batch)
+        logger.info(f"Prefill cache.set({next_batch.batch_id if next_batch is not None else None})")
         self.cache.set(next_batch)
 
         return generate_pb2.PrefillResponse(
@@ -156,6 +164,7 @@ class TextGenerationService(generate_pb2_grpc.TextGenerationServiceServicer):
             concat_ns = None
 
         generations, next_batch, timings = self.model.generate_token(batch)
+        logger.info(f"Decode cache.set({next_batch.batch_id if next_batch is not None else None})")
         self.cache.set(next_batch)
 
         return generate_pb2.DecodeResponse(
@@ -204,11 +213,21 @@ def serve(
             local_uri = _format_shard_uri(shard_uri_prefix, 0)
             server_uris = [local_uri]
 
+        world_size = int(os.getenv("WORLD_SIZE", "1"))
+        distributed_world = int(os.getenv("NUM_SHARD", "1")) < world_size
+        master_rank = int(os.getenv("RANK", "0")) == 0
+
+        if distributed_world:
+            os.environ["INIT_METHOD"] = os.getenv(
+                "INIT_METHOD",
+                f'tcp://{os.environ["MASTER_ADDR"]}:{os.environ["MASTER_PORT"]}'
+            )
+
         try:
             model = get_model(
                 model_id,
                 revision,
-                sharded,
+                sharded or distributed_world,
                 quantize,
                 speculate,
                 dtype,
@@ -219,9 +238,7 @@ def serve(
             raise
 
         # Can only do this after the distributed model has connected to the master shard
-        if (int(os.getenv("RANK", "0")) > 0
-            and int(os.getenv("NUM_SHARD", "1")) < int(os.getenv("WORLD_SIZE", "1"))
-        ):
+        if (distributed_world and not master_rank):
             assert (
                 shard_uri_prefix.startswith("tcp://")
             ), "Local shard URI must be TCP when NUM_SHARD < WORLD_SIZE"
@@ -230,18 +247,29 @@ def serve(
             ), "MASTER_ADDR must be set when NUM_SHARD < WORLD_SIZE"
             assert (
                 os.getenv("MASTER_SERVICE_PORT", None) is not None
-            ), "MASTER_SERVICE_PORT must be set when NUM_SHARD < WORLD_SIZE"
+            ), "MASTER_SERVICE_PORT must be set for non-master shards when NUM_SHARD < WORLD_SIZE"
 
-            # TODO assert that the local service_uris are resolved
             channel_url = f"{os.environ['MASTER_ADDR']}:{os.environ['MASTER_SERVICE_PORT']}"
             stub = generate_pb2_grpc.TextGenerationServiceStub(
                 insecure_channel(channel_url)
             )
-            stub.ServiceRegistration(
-                generate_pb2.ServiceRegistrationRequest(
-                    urls=server_uris
-                )
-            )
+
+            deadline = time.time() + int(os.getenv("REGISTRATION_TIMEOUT_SECONDS", "60"))
+            while True:
+                try:
+                    stub.Health(
+                        generate_pb2.HealthRequest()
+                    ) 
+                    stub.ServiceRegistration(
+                        generate_pb2.ServiceRegistrationRequest(
+                            urls=server_uris
+                        )
+                    )
+                    break
+                except BaseException as err:
+                    if time.time() >= deadline:
+                        raise RuntimeError(f"Could not register with the master shard at {channel_url}") from err
+                    time.sleep(0.1)
 
         server = aio.server(
             interceptors=[
@@ -252,7 +280,14 @@ def serve(
             ]
         )
         generate_pb2_grpc.add_TextGenerationServiceServicer_to_server(
-            TextGenerationService(model, Cache(), quantize, server_uris), server
+            TextGenerationService(
+                model,
+                Cache(),
+                quantize,
+                server_uris,
+                world_size
+            ),
+                server
         )
         SERVICE_NAMES = (
             generate_pb2.DESCRIPTOR.services_by_name["TextGenerationService"].full_name,

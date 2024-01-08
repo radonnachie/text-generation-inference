@@ -24,7 +24,11 @@ service TextGenerationService {
 }
 
 message HealthRequest {}
-message HealthResponse {}
+message HealthResponse {
+    uint32 world_size = 1;
+    uint32 registered_shards = 2;
+    bool all_shards_registered = 3;
+}
 
 /// Empty request
 message InfoRequest {}

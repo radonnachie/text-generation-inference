@@ -12,6 +12,8 @@ use std::fs::File;
 use std::io::BufReader;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::Path;
+use std::thread::sleep;
+use std::time::{Duration, Instant};
 use text_generation_client::{ClientError, ShardedClient};
 use text_generation_router::{server, HubModelInfo, HubTokenizerConfig};
 use thiserror::Error;
@@ -275,8 +277,31 @@ async fn main() -> Result<(), RouterError> {
         Some(pipeline_tag) => pipeline_tag.as_str() == "text-generation",
     };
 
-    // Instantiate sharded client from the master unix socket
-    let mut sharded_client = ShardedClient::connect_uds(master_shard_uds_path)
+    // Instantiate sharded client from the master uri
+    let mut master_client = text_generation_client::Client::connect_shard(master_shard_uri.clone())
+        .await
+        .map_err(RouterError::Connection)?;
+
+    let mut wait_time = Instant::now();
+    while let Ok(health) = master_client.health().await {
+        if health.all_shards_registered {
+            break;
+        }
+        if wait_time.elapsed() > Duration::from_secs(5) {
+            tracing::info!(
+                "Waiting for all shards to register to {}...({}/{})",
+                master_shard_uri,
+                health.registered_shards,
+                health.world_size
+            );
+            wait_time = Instant::now();
+        }
+        sleep(Duration::from_millis(500));
+    }
+
+    // Get info from the shard
+    let shard_info = master_client.info().await.map_err(RouterError::Info)?;
+    let mut sharded_client = ShardedClient::from_master_client(master_client)
         .await
         .map_err(RouterError::Connection)?;
     // Clear the cache; useful if the webserver rebooted
@@ -284,8 +309,6 @@ async fn main() -> Result<(), RouterError> {
         .clear_cache(None)
         .await
         .map_err(RouterError::Cache)?;
-    // Get info from the shard
-    let shard_info = sharded_client.info().await.map_err(RouterError::Info)?;
 
     // Warmup model
     tracing::info!("Warming up model");
