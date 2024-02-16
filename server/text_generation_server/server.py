@@ -246,10 +246,10 @@ def serve(
                 os.getenv("MASTER_ADDR", None) is not None
             ), "MASTER_ADDR must be set when NUM_SHARD < WORLD_SIZE"
             assert (
-                os.getenv("MASTER_SERVICE_PORT", None) is not None
-            ), "MASTER_SERVICE_PORT must be set for non-master shards when NUM_SHARD < WORLD_SIZE"
+                os.getenv("WORLD_SERVICE_PORT", None) is not None
+            ), "WORLD_SERVICE_PORT must be set for non-master shards when NUM_SHARD < WORLD_SIZE"
 
-            channel_url = f"{os.environ['MASTER_ADDR']}:{os.environ['MASTER_SERVICE_PORT']}"
+            channel_url = f"{os.environ['MASTER_ADDR']}:{os.environ['WORLD_SERVICE_PORT']}"
             stub = generate_pb2_grpc.TextGenerationServiceStub(
                 insecure_channel(channel_url)
             )

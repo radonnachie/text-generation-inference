@@ -18,6 +18,8 @@ use std::{fs, io};
 use tracing_subscriber::EnvFilter;
 use http::Uri;
 use std::net::TcpStream;
+use gethostname::gethostname;
+use regex::Regex;
 
 mod env_runtime;
 
@@ -321,10 +323,23 @@ struct Args {
     #[clap(default_value = "29500", long, env)]
     master_port: usize,
 
+    /// Whether or not the instance is part of a Kubernetes StatefulSet deployment.
+    /// If active, this argument triggers automated determination of the following
+    /// arguments' values:
+    /// - `shard_uri`: tcp://$(hostname):$(world_service_port))
+    /// - `world_rank_offset`: match(hostname, r'.*-(\d+)')
+    /// - `headless`: world_rank_offset != 0
+    /// - `master_addr`:  world_rank_offset == 0 ? '0.0.0.0' : master_pod_hostname
+    /// It is still necessary to provide values for the following arguments:
+    /// - `world_service_port`: the port of communication between shards
+    /// - `world_num_shard`: the size of the StatefulSet 
+    #[clap(long, env)]
+    kubernetes_statefulset_deployment: bool,
+
     /// The port the world-master shard service will listen on, at the `master_addr`
     /// address.
     #[clap(long, env)]
-    world_master_service_port: Option<usize>,
+    world_service_port: Option<usize>,
 
     /// The rank offset for these local shards, ranking them within the world.
     #[clap(long, env)]
@@ -436,7 +451,7 @@ fn shard_manager(
     num_shard: usize,
     master_addr: String,
     master_port: usize,
-    world_master_service_port: Option<usize>,
+    world_service_port: Option<usize>,
     world_rank_offset: Option<usize>,
     world_num_shard: Option<usize>,
     huggingface_hub_cache: Option<String>,
@@ -540,8 +555,8 @@ fn shard_manager(
     // Local Sharding Env vars
     envs.push(("RANK_LOCAL".into(), rank.to_string().into()));
     envs.push(("NUM_SHARD".into(), num_shard.to_string().into()));
-    if let Some(service_port) = world_master_service_port {
-        envs.push(("MASTER_SERVICE_PORT".into(), service_port.to_string().into()));
+    if let Some(service_port) = world_service_port {
+        envs.push(("WORLD_SERVICE_PORT".into(), service_port.to_string().into()));
     }
 
     // Torch Distributed Env vars
@@ -820,6 +835,29 @@ fn log_lines<S: Sized + BufRead>(lines: Lines<S>) {
     }
 }
 
+fn find_kubernetes_rank() -> Result<usize, String> {
+    let re: Regex = Regex::new(r"(.*)-(\d+)$").unwrap();
+    let hostname = gethostname().into_string().unwrap();
+    let Some(hostname_parts) = re.captures(hostname.as_str()) else {
+        return Err(format!("Could not parse hostname '{}' with pattern {}", hostname, re));
+    };
+    return Ok(hostname_parts.get(2).unwrap().as_str().parse::<usize>().unwrap());
+}
+
+fn find_kubernetes_uri(service_port: u16) -> Result<String, String> {
+    let hostname = gethostname().into_string().unwrap();
+    return Ok(format!("tcp://{}:{}", hostname, service_port));
+}
+
+fn find_kubernetes_master_addr() -> Result<String, String> {
+    let re: Regex = Regex::new(r"(.*)-(\d+)$").unwrap();
+    let hostname = gethostname().into_string().unwrap();
+    let Some(hostname_parts) = re.captures(hostname.as_str()) else {
+        return Err(format!("Could not parse hostname '{}' with pattern {}", hostname, re));
+    };
+    return Ok(format!("{}-0", hostname_parts.get(1).unwrap().as_str()));
+}
+
 fn find_num_shards(
     sharded: Option<bool>,
     num_shard: Option<usize>,
@@ -1013,13 +1051,36 @@ fn spawn_shards(
 ) -> Result<(), LauncherError> {
     // Start shard processes
     for rank in 0..num_shard {
+        let world_num_shard = args.world_num_shard.clone();
+        let world_service_port = args.world_service_port.clone();
+        let world_rank_offset = match args.kubernetes_statefulset_deployment {
+            false => args.world_rank_offset.clone(),
+            true => {
+                assert!(world_num_shard.is_some(), "World Number of Shards must be specified in a Kubernetes StatefulSet Deployment.");
+                Some(find_kubernetes_rank().unwrap())
+            }
+        };
+        let shard_uri = match args.kubernetes_statefulset_deployment {
+            false => args.shard_uri.clone(),
+            true => {
+                assert!(world_service_port.is_some(), "World Service Port must be specified in a Kubernetes StatefulSet Deployment.");
+                find_kubernetes_uri(world_service_port.unwrap() as u16).unwrap()
+            }
+        };
+        let master_addr = match args.kubernetes_statefulset_deployment {
+            false => args.master_addr.clone(),
+            true => {
+                if world_rank_offset.unwrap() == 0 {
+                    "0.0.0.0".into()
+                } else {
+                    find_kubernetes_master_addr().unwrap()
+                }
+            }
+        };
+        println!("master_addr: {}", master_addr);
+
         let model_id = args.model_id.clone();
         let revision = args.revision.clone();
-        let shard_uri = args.shard_uri.clone();
-        let master_addr = args.master_addr.clone();
-        let world_master_service_port = args.world_master_service_port.clone();
-        let world_rank_offset = args.world_rank_offset.clone();
-        let world_num_shard = args.world_num_shard.clone();
         let huggingface_hub_cache = args.huggingface_hub_cache.clone();
         let weights_cache_override = args.weights_cache_override.clone();
         let status_sender = status_sender.clone();
@@ -1055,7 +1116,7 @@ fn spawn_shards(
                 num_shard,
                 master_addr,
                 master_port,
-                world_master_service_port,
+                world_service_port,
                 world_rank_offset,
                 world_num_shard,
                 huggingface_hub_cache,
@@ -1124,11 +1185,17 @@ fn spawn_webserver(
 ) -> Result<Child, LauncherError> {
     // All shard started
     // Start webserver
-
-    let master_shard_uri = args.shard_uri.parse::<Uri>().unwrap();
+    let shard_uri = match args.kubernetes_statefulset_deployment {
+        false => args.shard_uri.clone(),
+        true => {
+            assert!(args.world_service_port.is_some(), "World Service Port must be specified in a Kubernetes StatefulSet Deployment.");
+            find_kubernetes_uri(args.world_service_port.unwrap() as u16).unwrap()
+        }
+    };
+    let master_shard_uri = shard_uri.parse::<Uri>().unwrap();
     let master_shard_uri = match master_shard_uri.scheme_str() {
-        Some("tcp") => args.shard_uri,
-        _ => format!("{}-0", args.shard_uri),
+        Some("tcp") => shard_uri,
+        _ => format!("{}-0", shard_uri),
     };
 
     tracing::info!("Starting Webserver");
@@ -1425,13 +1492,18 @@ fn main() -> Result<(), LauncherError> {
         return Ok(());
     }
 
-    let mut webserver = match args.headless {
+    let headless = match args.kubernetes_statefulset_deployment {
+        false => args.headless,
+        true => find_kubernetes_rank().unwrap() != 0,
+    };
+
+    let mut webserver = match headless {
         false => Some(spawn_webserver(num_shard, args, shutdown.clone(), &shutdown_receiver)
             .map_err(|err| {
                 shutdown_shards(shutdown.clone(), &shutdown_receiver);
                 err
-            })?
-        ),
+            })
+        ?),
         true => None
     };
 
