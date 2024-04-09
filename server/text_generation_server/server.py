@@ -26,7 +26,8 @@ class TextGenerationService(generate_pb2_grpc.TextGenerationServiceServicer):
         cache: Cache,
         quantize: Optional[str],
         server_urls: List[str],
-        world_size: int
+        world_size: int,
+        disable_inference_mode: bool = False
     ):
         self.cache = cache
         self.model = model
@@ -35,8 +36,12 @@ class TextGenerationService(generate_pb2_grpc.TextGenerationServiceServicer):
         self.world_size = world_size
         # For some reason, inference_mode does not work well with GLOO which we use on CPU
         if model.device.type == "cuda":
-            # Force inference mode for the lifetime of TextGenerationService
-            self._inference_mode_raii_guard = torch._C._InferenceMode(True)
+            if disable_inference_mode:
+                # Doesn't work well in distributed compute either
+                logger.warning("Inference mode will not be enabled.")
+            else:
+                # Force inference mode for the lifetime of TextGenerationService
+                self._inference_mode_raii_guard = torch._C._InferenceMode(True)
 
     async def Info(self, request, context):
         return self.model.info
@@ -70,7 +75,6 @@ class TextGenerationService(generate_pb2_grpc.TextGenerationServiceServicer):
         if batch is None:
             raise ValueError(f"Batch ID {request.batch_id if request is not None else None} not found in cache.")
         filtered_batch = batch.filter(request.request_ids)
-        logger.info(f"FilterBatch cache.set({filtered_batch.batch_id if filtered_batch is not None else None})")
         self.cache.set(filtered_batch)
 
         return generate_pb2.FilterBatchResponse(batch=filtered_batch.to_pb())
@@ -129,7 +133,6 @@ class TextGenerationService(generate_pb2_grpc.TextGenerationServiceServicer):
             )
 
         generations, next_batch, timings = self.model.generate_token(batch)
-        logger.info(f"Prefill cache.set({next_batch.batch_id if next_batch is not None else None})")
         self.cache.set(next_batch)
 
         return generate_pb2.PrefillResponse(
@@ -164,7 +167,6 @@ class TextGenerationService(generate_pb2_grpc.TextGenerationServiceServicer):
             concat_ns = None
 
         generations, next_batch, timings = self.model.generate_token(batch)
-        logger.info(f"Decode cache.set({next_batch.batch_id if next_batch is not None else None})")
         self.cache.set(next_batch)
 
         return generate_pb2.DecodeResponse(
@@ -251,25 +253,34 @@ def serve(
 
             channel_url = f"{os.environ['MASTER_ADDR']}:{os.environ['WORLD_SERVICE_PORT']}"
             stub = generate_pb2_grpc.TextGenerationServiceStub(
-                insecure_channel(channel_url)
+                insecure_channel(
+                    channel_url,
+                    options = (
+                        (
+                            'grpc.enable_http_proxy',
+                            int(os.getenv("GRPC_ARG_ENABLE_HTTP_PROXY", "1"))
+                        ),
+                    )
+                ),
             )
 
             deadline = time.time() + int(os.getenv("REGISTRATION_TIMEOUT_SECONDS", "60"))
+            timeout = int(os.getenv("REGISTRATION_ATTEMPT_TIMEOUT_SECONDS", "60"))
             while True:
                 try:
-                    stub.Health(
-                        generate_pb2.HealthRequest()
-                    ) 
                     stub.ServiceRegistration(
                         generate_pb2.ServiceRegistrationRequest(
                             urls=server_uris
-                        )
+                        ),
+                        timeout=timeout,
+                        wait_for_ready=True
                     )
                     break
                 except BaseException as err:
                     if time.time() >= deadline:
                         raise RuntimeError(f"Could not register with the master shard at {channel_url}") from err
-                    time.sleep(0.1)
+                    logger.warning(f"Retrying service registration at '{channel_url}' after error: {err}")
+                    time.sleep(0.5)
 
         server = aio.server(
             interceptors=[
@@ -279,13 +290,18 @@ def serve(
                 else UDSOpenTelemetryAioServerInterceptor()
             ]
         )
+        disable_inference_mode = os.getenv("TGI_TORCH_INFERENCE_MODE_DISABLE", "false") != "false"
+        if disable_inference_mode:
+            logger.info("TGI_TORCH_INFERENCE_MODE_DISABLE != false")
+
         generate_pb2_grpc.add_TextGenerationServiceServicer_to_server(
             TextGenerationService(
                 model,
                 Cache(),
                 quantize,
                 server_uris,
-                world_size
+                world_size,
+                disable_inference_mode=disable_inference_mode
             ),
                 server
         )

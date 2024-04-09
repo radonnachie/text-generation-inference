@@ -18,7 +18,7 @@ use std::{fs, io};
 use tracing_subscriber::EnvFilter;
 use http::Uri;
 use std::net::TcpStream;
-use gethostname::gethostname;
+use dns_lookup::{get_hostname, getaddrinfo, getnameinfo};
 use regex::Regex;
 
 mod env_runtime;
@@ -837,25 +837,55 @@ fn log_lines<S: Sized + BufRead>(lines: Lines<S>) {
 
 fn find_kubernetes_rank() -> Result<usize, String> {
     let re: Regex = Regex::new(r"(.*)-(\d+)$").unwrap();
-    let hostname = gethostname().into_string().unwrap();
+    let hostname = get_hostname().unwrap();
     let Some(hostname_parts) = re.captures(hostname.as_str()) else {
-        return Err(format!("Could not parse hostname '{}' with pattern {}", hostname, re));
+        return Err(format!("Could not parse hostname '{}' as pattern `{}`", hostname, re));
     };
     return Ok(hostname_parts.get(2).unwrap().as_str().parse::<usize>().unwrap());
 }
 
+fn get_hostname_fqdn() -> Result<String, String> {
+    let hostname = get_hostname().unwrap();
+    let fqdn_tuple_result = getaddrinfo(Some(hostname.as_str()), None, None).unwrap()
+        .filter_map(|addr| addr.ok())
+        .filter_map(|addr| getnameinfo(&addr.sockaddr, 0).ok())
+        .next();
+    return match fqdn_tuple_result {
+        None => Err(hostname),
+        Some((host_fqdn, _service_fqdn)) => {
+            Ok(host_fqdn)
+        }
+    }
+}
+
 fn find_kubernetes_uri(service_port: u16) -> Result<String, String> {
-    let hostname = gethostname().into_string().unwrap();
+    let hostname = match get_hostname_fqdn() {
+        Ok(fqdn) => fqdn,
+        Err(hostname) => hostname
+    };
     return Ok(format!("tcp://{}:{}", hostname, service_port));
 }
 
 fn find_kubernetes_master_addr() -> Result<String, String> {
     let re: Regex = Regex::new(r"(.*)-(\d+)$").unwrap();
-    let hostname = gethostname().into_string().unwrap();
+    let hostname = get_hostname().unwrap();
     let Some(hostname_parts) = re.captures(hostname.as_str()) else {
         return Err(format!("Could not parse hostname '{}' with pattern {}", hostname, re));
     };
-    return Ok(format!("{}-0", hostname_parts.get(1).unwrap().as_str()));
+    let master_hostname = format!("{}-0", hostname_parts.get(1).unwrap().as_str());
+    
+    return Ok(match get_hostname_fqdn() {
+        Ok(host_fqdn) => {
+            let mut fqdn_parts: Vec<String> = host_fqdn.split('.')
+                .map(|s| s.to_string())
+                .collect();
+            fqdn_parts[0] = master_hostname;
+            fqdn_parts.join(".")
+        },
+        Err(hostname) => {
+            format!("{}-0", hostname_parts.get(1).unwrap().as_str())
+        }
+    });
 }
 
 fn find_num_shards(
@@ -1071,13 +1101,16 @@ fn spawn_shards(
             false => args.master_addr.clone(),
             true => {
                 if world_rank_offset.unwrap() == 0 {
-                    "0.0.0.0".into()
+                    if args.master_addr.ne("localhost")  {
+                        args.master_addr.clone()
+                    } else {
+                        "0.0.0.0".into()
+                    }
                 } else {
-                    find_kubernetes_master_addr().unwrap()
+                    find_kubernetes_master_addr().unwrap()  
                 }
             }
         };
-        println!("master_addr: {}", master_addr);
 
         let model_id = args.model_id.clone();
         let revision = args.revision.clone();
@@ -1187,7 +1220,7 @@ fn spawn_webserver(
     // Start webserver
     let shard_uri = match args.kubernetes_statefulset_deployment {
         false => args.shard_uri.clone(),
-        true => {
+        true => { // Kubernetes Statefulset Deployment
             assert!(args.world_service_port.is_some(), "World Service Port must be specified in a Kubernetes StatefulSet Deployment.");
             find_kubernetes_uri(args.world_service_port.unwrap() as u16).unwrap()
         }
@@ -1494,7 +1527,7 @@ fn main() -> Result<(), LauncherError> {
 
     let headless = match args.kubernetes_statefulset_deployment {
         false => args.headless,
-        true => find_kubernetes_rank().unwrap() != 0,
+        true => find_kubernetes_rank().unwrap() != 0 // Kubernetes Statefulset Deployment
     };
 
     let mut webserver = match headless {

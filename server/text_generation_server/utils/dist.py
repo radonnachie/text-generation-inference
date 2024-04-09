@@ -6,6 +6,7 @@ from loguru import logger
 
 # Tensor Parallelism settings
 RANK = int(os.getenv("RANK", "0"))
+RANK_LOCAL = int(os.getenv("RANK_LOCAL", "0"))
 WORLD_SIZE = int(os.getenv("WORLD_SIZE", "1"))
 
 # CUDA memory fraction
@@ -48,8 +49,8 @@ def initialize_torch_distributed():
         from torch.distributed import ProcessGroupNCCL
 
         # Set the device id.
-        # assert WORLD_SIZE <= torch.cuda.device_count(), "Each process is one gpu"
-        device = RANK % torch.cuda.device_count()
+        assert RANK_LOCAL <= torch.cuda.device_count(), "Each local rank process is one gpu"
+        device = RANK_LOCAL % torch.cuda.device_count()
         torch.cuda.set_device(device)
         torch.cuda.set_per_process_memory_fraction(MEMORY_FRACTION, device)
         backend = "nccl"
@@ -59,12 +60,13 @@ def initialize_torch_distributed():
     else:
         backend = "gloo"
         options = None
+        device = None
 
     if WORLD_SIZE == 1:
-        return FakeGroup(RANK, WORLD_SIZE), RANK, WORLD_SIZE
+        return FakeGroup(RANK, WORLD_SIZE), RANK, WORLD_SIZE, device
     else:
         if os.getenv("DEBUG", None) == "1":
-            return FakeGroup(RANK, WORLD_SIZE), RANK, WORLD_SIZE
+            return FakeGroup(RANK, WORLD_SIZE), RANK, WORLD_SIZE, device
 
         if not torch.distributed.is_initialized():
             # Call the init process.
@@ -79,4 +81,4 @@ def initialize_torch_distributed():
         else:
             logger.warning("torch.distributed is already initialized.")
 
-        return torch.distributed.group.WORLD, RANK, WORLD_SIZE
+        return torch.distributed.group.WORLD, RANK, WORLD_SIZE, device
