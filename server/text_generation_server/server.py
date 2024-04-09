@@ -258,7 +258,7 @@ def serve(
                     options = (
                         (
                             'grpc.enable_http_proxy',
-                            int(os.getenv("GRPC_ARG_ENABLE_HTTP_PROXY", "1"))
+                            1 if os.getenv("GRPC_ARG_ENABLE_HTTP_PROXY", "true") == "true" else 0
                         ),
                     )
                 ),
